@@ -5,6 +5,7 @@ Features: 1) Background Blur  2) Draw Plate  3) Crop + Download + Delete
 
 import os
 import io
+import gc
 import uuid
 import base64
 from datetime import datetime
@@ -193,6 +194,10 @@ def blur_bg(image_id):
     except Exception as _e:
         print(f'[blur_bg] cleanup error (non-fatal): {_e}')
 
+    # FIX: free memory from the mask-cleanup pipeline before the next
+    # heavy step (background blur compositing) runs.
+    gc.collect()
+
     # Step 2: Apply blur — keep car sharp, blur real background
     pf       = _processed_folder()
     out_path = os.path.join(pf, f'blur_{rec.id}.jpg')
@@ -210,6 +215,10 @@ def blur_bg(image_id):
             fallback.save(out_path, 'JPEG', quality=95)
         except Exception:
             return jsonify({'error': 'Save failed'}), 500
+
+    # FIX: release all large image buffers from this request immediately
+    # instead of waiting for the function to return.
+    gc.collect()
 
     rec.processed_path = out_path
     rec.status         = 'completed'
@@ -280,6 +289,10 @@ def apply_plate(image_id):
             stamped.save(out_path, 'PNG')
         except Exception as _le:
             print(f'[apply_plate] watermark failed (non-fatal): {_le}')
+
+        # FIX: release image buffers from this request immediately
+        gc.collect()
+
         rec.processed_path = out_path
         rec.status         = 'completed'
         db.session.commit()
@@ -317,6 +330,7 @@ def save_crop(image_id):
         pf        = _processed_folder()
         out_path  = os.path.join(pf, f'crop_{rec.id}.png')
         img.save(out_path, 'PNG')
+        gc.collect()
         rec.processed_path = out_path
         rec.status         = 'completed'
         db.session.commit()

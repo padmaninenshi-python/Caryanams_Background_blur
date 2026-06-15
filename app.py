@@ -1,12 +1,13 @@
 """
 Standalone Remove Background + Number Plate Tool
-Run: python app.py
+Run locally:   python app.py
+Run on Render: gunicorn -w 1 --timeout 180 -k gthread --threads 2 app:app
 Visit: http://localhost:5000
 """
-
 import os
 from flask import Flask
 from extensions import db
+
 
 def create_app():
     app = Flask(__name__)
@@ -36,7 +37,12 @@ def create_app():
     return app
 
 
+# FIX: module-level app object so gunicorn can import it as "app:app"
+# (gunicorn cannot call create_app() automatically unless using the
+#  factory syntax "app:create_app()", so this is the safer option)
+app = create_app()
+
+
 if __name__ == '__main__':
-    app = create_app()
     print("\n✅  Remove BG Tool running at http://localhost:5000\n")
     app.run(debug=True, port=5000)
