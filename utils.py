@@ -161,77 +161,92 @@ def _resize_for_removal(filepath, max_side=1024):
     return buf.getvalue(), orig_size
 
 
-def apply_60_percent_background_blur(original_image_path, masked_image_rgba):
+def apply_60_percent_background_blur(original_image_path, masked_image_rgba=None):
     """
-    Takes original image and a masked car image (RGBA with transparent background).
-    Returns new image with:
-    - Car fully sharp (original clarity, EXACT same position)
+    Takes original image and (optionally) a masked car image (RGBA with
+    transparent background). Returns new image with:
+    - Car area sharp (original clarity, EXACT same position)
     - Real background blurred
     - Original composition preserved (no car repositioning)
-    
+
     This creates a professional focus/depth-of-field effect where the car
     stands out with a beautifully blurred background while maintaining
     the exact original composition.
-    
+
+    IMPORTANT — this function is now "bulletproof": it NEVER silently
+    returns the original unblurred image. If `masked_image_rgba` is
+    missing, unreadable, or degenerate (alpha ~0 everywhere = nothing kept,
+    or alpha ~255 everywhere = whole photo treated as "car" so nothing to
+    blur), it falls back to a sensible centered-rectangle car mask so the
+    surrounding background (corners/edges of the photo) always gets
+    visibly blurred.
+
     Process:
     1. Load original image (full color, preserves composition)
-    2. Use mask to identify car vs background pixels
-    3. Apply Gaussian blur to background ONLY
+    2. Use mask (or a center-rectangle fallback) to identify car vs background
+    3. Apply a strong Gaussian blur to background ONLY
     4. Keep car area from original (sharp)
     5. Return as RGB image (no transparency)
     """
+    import cv2
+
+    original = Image.open(original_image_path).convert('RGB')
+    orig_cv  = cv2.cvtColor(np.array(original), cv2.COLOR_RGB2BGR)
+    h_img, w_img = orig_cv.shape[:2]
+
+    # ── Build car_mask (uint8, car=255 / background=0) ───────────────────
+    car_mask = None
     try:
-        import cv2
-        
-        # Load images
-        original = Image.open(original_image_path).convert('RGB')
-        masked = masked_image_rgba.convert('RGBA')
-        
-        # Ensure same size
-        if original.size != masked.size:
-            original = original.resize(masked.size, Image.LANCZOS)
-        
-        # Convert to numpy arrays
-        orig_cv = cv2.cvtColor(np.array(original), cv2.COLOR_RGB2BGR)
-        
-        # Get alpha channel from masked image (car = 255, background = 0)
-        alpha_mask = np.array(masked.split()[3])
-        
-        # Create binary mask: car = 255, background = 0
-        car_mask = (alpha_mask > 128).astype(np.uint8) * 255
-        
-        # ── Strong, size-adaptive background blur (~80% visible blur) ───────
-        # Sigma scales with image size so the blur is clearly visible on
-        # both small and large photos. (0,0) kernel size lets OpenCV pick
-        # the correct kernel for the given sigma.
-        h_img, w_img = orig_cv.shape[:2]
-        blur_sigma = max(18, int(min(h_img, w_img) * 0.035))
-        blurred_bg = cv2.GaussianBlur(orig_cv, (0, 0), sigmaX=blur_sigma, sigmaY=blur_sigma)
-        # Second pass for an extra-soft, strongly blurred background
-        blurred_bg = cv2.GaussianBlur(blurred_bg, (0, 0), sigmaX=blur_sigma * 0.6, sigmaY=blur_sigma * 0.6)
-        
-        # Create smooth mask for blending (feathered edges)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        feathered_mask = cv2.morphologyEx(car_mask, cv2.MORPH_CLOSE, k)
-        feathered_mask = cv2.GaussianBlur(feathered_mask, (15, 15), 0)
-        feathered_mask_3ch = cv2.cvtColor(feathered_mask, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
-        
-        # IMPORTANT: Keep car pixels from ORIGINAL image (sharp)
-        # Only blend background (blurred)
-        # This preserves exact original car position and orientation
-        final = (orig_cv * feathered_mask_3ch + blurred_bg * (1.0 - feathered_mask_3ch)).astype(np.uint8)
-        
-        # Convert back to RGB PIL Image
-        result_rgb = cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(result_rgb, 'RGB')
-        
+        if masked_image_rgba is not None:
+            masked = masked_image_rgba.convert('RGBA')
+            if masked.size != original.size:
+                masked = masked.resize(original.size, Image.LANCZOS)
+            alpha_mask = np.array(masked.split()[3])
+            fg_ratio = float((alpha_mask > 128).mean())
+            # Reject degenerate masks: nothing detected, or the whole
+            # photo marked as "car" (this was the original bug — when AI
+            # removal failed, the fallback alpha was 255 everywhere and
+            # nothing ever got blurred).
+            if 0.02 < fg_ratio < 0.97:
+                car_mask = (alpha_mask > 128).astype(np.uint8) * 255
+            else:
+                print(f'[bg_blur] degenerate mask (fg_ratio={fg_ratio:.3f}) — using center-rect fallback')
     except Exception as e:
-        print(f'[apply_60_percent_background_blur] error: {e}')
-        # Fallback: return original
-        try:
-            return Image.open(original_image_path).convert('RGB')
-        except:
-            return masked_image_rgba.convert('RGB')
+        print(f'[bg_blur] mask read error: {e} — using center-rect fallback')
+        car_mask = None
+
+    if car_mask is None:
+        # Fallback: assume the car occupies a centered rectangle. This
+        # guarantees the surrounding background (sky, walls, road edges)
+        # always gets blurred, even with no usable AI mask.
+        car_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+        x0, x1 = int(w_img * 0.06), int(w_img * 0.94)
+        y0, y1 = int(h_img * 0.22), int(h_img * 0.98)
+        car_mask[y0:y1, x0:x1] = 255
+
+    # ── Strong, size-adaptive background blur (~80% visible blur) ────────
+    # Sigma scales with image size so the blur is clearly visible on
+    # both small and large photos. (0,0) kernel size lets OpenCV pick
+    # the correct kernel for the given sigma.
+    blur_sigma = max(18, int(min(h_img, w_img) * 0.035))
+    blurred_bg = cv2.GaussianBlur(orig_cv, (0, 0), sigmaX=blur_sigma, sigmaY=blur_sigma)
+    # Second pass for an extra-soft, strongly blurred background
+    blurred_bg = cv2.GaussianBlur(blurred_bg, (0, 0), sigmaX=blur_sigma * 0.6, sigmaY=blur_sigma * 0.6)
+
+    # Create smooth mask for blending (feathered edges)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    feathered_mask = cv2.morphologyEx(car_mask, cv2.MORPH_CLOSE, k)
+    feathered_mask = cv2.GaussianBlur(feathered_mask, (15, 15), 0)
+    feathered_mask_3ch = cv2.cvtColor(feathered_mask, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
+
+    # IMPORTANT: Keep car pixels from ORIGINAL image (sharp)
+    # Only blend background (blurred)
+    # This preserves exact original car position and orientation
+    final = (orig_cv * feathered_mask_3ch + blurred_bg * (1.0 - feathered_mask_3ch)).astype(np.uint8)
+
+    # Convert back to RGB PIL Image
+    result_rgb = cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(result_rgb, 'RGB')
 
 
 def get_fallback_blur_mask(filepath):
