@@ -161,23 +161,27 @@ def blur_bg(image_id):
     """Remove background via OpenCV GrabCut and apply depth-of-field blur to background only.
     Uses OpenCV directly (no rembg/onnxruntime) to avoid Render timeout/memory 502 errors.
     Result: Sharp car + beautifully blurred original background (like DSLR bokeh).
+
+    FIX: Max resize reduced from 1600 → 1024 to prevent OOM/timeout on Render free tier.
+    FIX: Fallback always produces output instead of returning 500.
     """
     rec = ProcessedImage.query.get(image_id)
     if not rec:
         return jsonify({'error': 'Image not found'}), 404
 
-    # Always use original image as source for blur (avoids chained processed paths)
+    # Always use original image as source for blur
     src_path = rec.original_path
 
-    # Step 1: Resize large images before processing to avoid Render memory/timeout
+    # ── FIX: 1024px max (was 1600 — caused OOM/502 on Render free tier) ──────
     _resized_path = None
     try:
         _img_check = Image.open(src_path)
         _w, _h = _img_check.size
         _img_check.close()
-        if max(_w, _h) > 1600:
-            import tempfile, os as _os
-            _scale  = 1600 / max(_w, _h)
+        MAX_SIDE = 1024  # FIX: was 1600
+        if max(_w, _h) > MAX_SIDE:
+            import tempfile
+            _scale  = MAX_SIDE / max(_w, _h)
             _img_rs = Image.open(src_path).convert('RGB')
             _img_rs = _img_rs.resize((int(_w * _scale), int(_h * _scale)), Image.LANCZOS)
             _tmp    = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
@@ -188,50 +192,47 @@ def blur_bg(image_id):
     except Exception as _rs_err:
         print(f'[blur_bg] resize check failed (non-fatal): {_rs_err}')
 
-    # Step 2: Use OpenCV GrabCut directly — skips rembg to avoid 502 on Render
+    # ── Use OpenCV GrabCut directly — skips rembg to avoid 502 on Render ─────
     result, method = remove_bg_car_opencv(src_path)
 
-    if result is None:
-        # Fallback: simple blur of whole image (still better than 502 error)
-        print('[blur_bg] GrabCut failed — falling back to full-image blur')
-        try:
-            import cv2, numpy as np
-            img_cv  = cv2.imread(src_path)
-            blurred = cv2.GaussianBlur(img_cv, (31, 31), 0)
-            result_pil = Image.fromarray(cv2.cvtColor(blurred, cv2.COLOR_BGR2RGB))
-            result = None  # signal to skip mask-based blur
-            _fallback_img = result_pil
-        except Exception:
-            _fallback_img = None
-        method = 'full_blur_fallback'
-    else:
-        _fallback_img = None
-
-    # Step 3: Apply blur — keep car sharp, blur real background
     pf       = _processed_folder()
     out_path = os.path.join(pf, f'blur_{rec.id}.jpg')
 
     try:
         if result is not None:
             blurred = apply_60_percent_background_blur(src_path, result)
-        elif _fallback_img is not None:
-            blurred = _fallback_img
         else:
-            blurred = Image.open(src_path).convert('RGB')
+            # ── FIX: Always produce output — simple blur fallback ─────────────
+            print('[blur_bg] GrabCut failed — falling back to simple full-image blur')
+            try:
+                import cv2
+                import numpy as np
+                img_cv  = cv2.imread(src_path)
+                if img_cv is not None:
+                    blurred_cv = cv2.GaussianBlur(img_cv, (31, 31), 0)
+                    blurred = Image.fromarray(cv2.cvtColor(blurred_cv, cv2.COLOR_BGR2RGB))
+                else:
+                    blurred = Image.open(src_path).convert('RGB')
+            except Exception:
+                blurred = Image.open(src_path).convert('RGB')
+            method = 'simple_blur_fallback'
 
-        # Apply BOTH watermarks
+        # Apply watermarks
         blurred = _apply_both_watermarks(blurred)
         blurred.save(out_path, 'JPEG', quality=92)
+
     except Exception as e:
         print(f'[blur_bg] blur failed: {e}')
+        # ── FIX: Last resort — watermarked original instead of 500 error ──────
         try:
             fallback = Image.open(src_path).convert('RGB')
             fallback = _apply_both_watermarks(fallback)
             fallback.save(out_path, 'JPEG', quality=92)
-        except Exception:
+            method = 'original_fallback'
+        except Exception as e2:
             if _resized_path and os.path.exists(_resized_path):
                 os.remove(_resized_path)
-            return jsonify({'error': 'Save failed'}), 500
+            return jsonify({'error': f'Processing failed: {e2}'}), 500
 
     # Cleanup temp resized file
     if _resized_path and os.path.exists(_resized_path):
@@ -303,7 +304,7 @@ def apply_plate(image_id):
     ok       = apply_plate_removal(src_path, out_path, *plate, mode=mode, quad=quad)
 
     if ok and os.path.exists(out_path):
-        # Apply BOTH watermarks
+        # Apply watermarks
         try:
             stamped = _apply_both_watermarks(Image.open(out_path))
             stamped.save(out_path, 'PNG')
@@ -341,7 +342,7 @@ def save_crop(image_id):
     try:
         img_bytes = base64.b64decode(b64data)
         img       = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        # Apply BOTH watermarks
+        # Apply watermarks
         img = _apply_both_watermarks(img)
         pf        = _processed_folder()
         out_path  = os.path.join(pf, f'crop_{rec.id}.png')
