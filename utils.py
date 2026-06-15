@@ -249,6 +249,78 @@ def apply_60_percent_background_blur(original_image_path, masked_image_rgba=None
     return Image.fromarray(result_rgb, 'RGB')
 
 
+def get_blur_car_mask(filepath, max_side=600):
+    """
+    FAST, lightweight car-region mask — used ONLY by the background-blur
+    feature.
+
+    The full pipeline (remove_bg_ai -> rembg/grabcut + keep_largest_component
+    + remove_persons_and_objects + remove_connected_persons + trim_side_cars
+    + trim_top_objects + remove_thin_protrusions + restore_tyres +
+    restore_windshield) is overkill and SLOW for blur purposes — on Render's
+    free-tier CPU it can take many seconds per image, and rembg isn't even
+    installed so that attempt is wasted work every time.
+
+    For blur we don't need a pixel-perfect cutout — just a rough "this is
+    roughly where the car is" region so the rest of the photo can be
+    blurred. This does a SINGLE-PASS GrabCut at a small resolution
+    (max_side=600px) with light morphology cleanup only.
+
+    Returns a uint8 numpy mask (car=255, background=0) at the ORIGINAL
+    image resolution, or None if it can't produce a usable mask (caller
+    should then pass None to apply_60_percent_background_blur, which has
+    its own centered-rectangle fallback).
+    """
+    try:
+        import cv2
+        img_bgr = cv2.imread(filepath)
+        if img_bgr is None:
+            return None
+
+        h, w = img_bgr.shape[:2]
+        orig_size = (w, h)
+
+        scale = 1.0
+        work = img_bgr
+        if max(h, w) > max_side:
+            scale = max_side / max(h, w)
+            work = cv2.resize(img_bgr, (int(w * scale), int(h * scale)))
+        wh, ww = work.shape[:2]
+
+        margin_x = max(int(ww * 0.07), 4)
+        margin_y = max(int(wh * 0.05), 4)
+        rect = (margin_x, margin_y, ww - 2 * margin_x, wh - 2 * margin_y)
+
+        mask = np.zeros((wh, ww), np.uint8)
+        bgd  = np.zeros((1, 65), np.float64)
+        fgd  = np.zeros((1, 65), np.float64)
+        # Single pass, only 3 iterations — much faster than the full
+        # 5+8 iteration double-grabCut used elsewhere.
+        cv2.grabCut(work, mask, rect, bgd, fgd, 3, cv2.GC_INIT_WITH_RECT)
+
+        fg_mask = np.where(
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
+        ).astype(np.uint8)
+
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k, iterations=2)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  k, iterations=1)
+
+        fg_ratio = float(fg_mask.mean()) / 255.0
+        if fg_ratio < 0.03 or fg_ratio > 0.95:
+            # Degenerate result — let caller fall back to center-rect.
+            return None
+
+        if scale != 1.0:
+            fg_mask = cv2.resize(fg_mask, orig_size, interpolation=cv2.INTER_LINEAR)
+
+        return fg_mask
+
+    except Exception as e:
+        print(f'[get_blur_car_mask] error: {e}')
+        return None
+
+
 def get_fallback_blur_mask(filepath):
     """
     Last-resort foreground mask for the background-blur feature.
