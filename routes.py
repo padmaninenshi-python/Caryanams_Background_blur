@@ -19,7 +19,7 @@ from extensions import db
 from utils import (
     detect_number_plate, apply_plate_removal,
     apply_60_percent_background_blur,
-    remove_bg_ai, remove_bg_car_opencv,
+    remove_bg_ai,
     keep_largest_component, remove_persons_and_objects,
     remove_connected_persons, trim_side_cars,
     trim_top_objects, remove_thin_protrusions,
@@ -158,88 +158,58 @@ def upload():
 
 @bp.route('/api/blur-bg/<image_id>', methods=['POST'])
 def blur_bg(image_id):
-    """Remove background via OpenCV GrabCut and apply depth-of-field blur to background only.
-    Uses OpenCV directly (no rembg/onnxruntime) to avoid Render timeout/memory 502 errors.
+    """Remove background via AI and apply depth-of-field blur to background only.
     Result: Sharp car + beautifully blurred original background (like DSLR bokeh).
-
-    FIX: Max resize reduced from 1600 → 1024 to prevent OOM/timeout on Render free tier.
-    FIX: Fallback always produces output instead of returning 500.
     """
     rec = ProcessedImage.query.get(image_id)
     if not rec:
         return jsonify({'error': 'Image not found'}), 404
 
-    # Always use original image as source for blur
-    src_path = rec.original_path
+    data    = request.get_json(silent=True) or {}
+    quality = data.get('quality', 'standard')
 
-    # ── FIX: 1024px max (was 1600 — caused OOM/502 on Render free tier) ──────
-    _resized_path = None
+    # Use processed image as source if available (e.g. plate already hidden)
+    src_path = rec.processed_path or rec.original_path
+
+    # Step 1: AI BG removal to get car mask
+    result, method = remove_bg_ai(src_path, quality=quality)
+    if result is None:
+        try:
+            result = Image.open(src_path).convert('RGBA')
+            method = 'original_kept'
+        except Exception:
+            return jsonify({'error': 'BG removal failed'}), 500
+
+    # Step 1b: Cleanup mask
     try:
-        _img_check = Image.open(src_path)
-        _w, _h = _img_check.size
-        _img_check.close()
-        MAX_SIDE = 1024  # FIX: was 1600
-        if max(_w, _h) > MAX_SIDE:
-            import tempfile
-            _scale  = MAX_SIDE / max(_w, _h)
-            _img_rs = Image.open(src_path).convert('RGB')
-            _img_rs = _img_rs.resize((int(_w * _scale), int(_h * _scale)), Image.LANCZOS)
-            _tmp    = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
-            _img_rs.save(_tmp.name, 'JPEG', quality=90)
-            _resized_path = _tmp.name
-            src_path = _resized_path
-            print(f'[blur_bg] resized large image to {int(_w*_scale)}x{int(_h*_scale)} for processing')
-    except Exception as _rs_err:
-        print(f'[blur_bg] resize check failed (non-fatal): {_rs_err}')
+        result = keep_largest_component(result)
+        result = remove_persons_and_objects(result)
+        result = remove_connected_persons(result)
+        result = trim_side_cars(result)
+        result = trim_top_objects(result)
+        result = remove_thin_protrusions(result)
+        result = restore_tyres(result)
+        result = restore_windshield(result)
+    except Exception as _e:
+        print(f'[blur_bg] cleanup error (non-fatal): {_e}')
 
-    # ── Use OpenCV GrabCut directly — skips rembg to avoid 502 on Render ─────
-    result, method = remove_bg_car_opencv(src_path)
-
+    # Step 2: Apply blur — keep car sharp, blur real background
     pf       = _processed_folder()
     out_path = os.path.join(pf, f'blur_{rec.id}.jpg')
 
     try:
-        if result is not None:
-            blurred = apply_60_percent_background_blur(src_path, result)
-        else:
-            # ── FIX: Always produce output — simple blur fallback ─────────────
-            print('[blur_bg] GrabCut failed — falling back to simple full-image blur')
-            try:
-                import cv2
-                import numpy as np
-                img_cv  = cv2.imread(src_path)
-                if img_cv is not None:
-                    blurred_cv = cv2.GaussianBlur(img_cv, (31, 31), 0)
-                    blurred = Image.fromarray(cv2.cvtColor(blurred_cv, cv2.COLOR_BGR2RGB))
-                else:
-                    blurred = Image.open(src_path).convert('RGB')
-            except Exception:
-                blurred = Image.open(src_path).convert('RGB')
-            method = 'simple_blur_fallback'
-
-        # Apply watermarks
+        blurred = apply_60_percent_background_blur(src_path, result)
+        # Apply BOTH watermarks
         blurred = _apply_both_watermarks(blurred)
-        blurred.save(out_path, 'JPEG', quality=92)
-
+        blurred.save(out_path, 'JPEG', quality=95)
     except Exception as e:
         print(f'[blur_bg] blur failed: {e}')
-        # ── FIX: Last resort — watermarked original instead of 500 error ──────
         try:
             fallback = Image.open(src_path).convert('RGB')
             fallback = _apply_both_watermarks(fallback)
-            fallback.save(out_path, 'JPEG', quality=92)
-            method = 'original_fallback'
-        except Exception as e2:
-            if _resized_path and os.path.exists(_resized_path):
-                os.remove(_resized_path)
-            return jsonify({'error': f'Processing failed: {e2}'}), 500
-
-    # Cleanup temp resized file
-    if _resized_path and os.path.exists(_resized_path):
-        try:
-            os.remove(_resized_path)
+            fallback.save(out_path, 'JPEG', quality=95)
         except Exception:
-            pass
+            return jsonify({'error': 'Save failed'}), 500
 
     rec.processed_path = out_path
     rec.status         = 'completed'
@@ -304,7 +274,7 @@ def apply_plate(image_id):
     ok       = apply_plate_removal(src_path, out_path, *plate, mode=mode, quad=quad)
 
     if ok and os.path.exists(out_path):
-        # Apply watermarks
+        # Apply BOTH watermarks
         try:
             stamped = _apply_both_watermarks(Image.open(out_path))
             stamped.save(out_path, 'PNG')
@@ -342,7 +312,7 @@ def save_crop(image_id):
     try:
         img_bytes = base64.b64decode(b64data)
         img       = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        # Apply watermarks
+        # Apply BOTH watermarks
         img = _apply_both_watermarks(img)
         pf        = _processed_folder()
         out_path  = os.path.join(pf, f'crop_{rec.id}.png')
