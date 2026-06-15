@@ -19,7 +19,7 @@ from extensions import db
 from utils import (
     detect_number_plate, apply_plate_removal,
     apply_60_percent_background_blur,
-    remove_bg_ai,
+    remove_bg_ai, remove_bg_car_opencv,
     keep_largest_component, remove_persons_and_objects,
     remove_connected_persons, trim_side_cars,
     trim_top_objects, remove_thin_protrusions,
@@ -158,58 +158,87 @@ def upload():
 
 @bp.route('/api/blur-bg/<image_id>', methods=['POST'])
 def blur_bg(image_id):
-    """Remove background via AI and apply depth-of-field blur to background only.
+    """Remove background via OpenCV GrabCut and apply depth-of-field blur to background only.
+    Uses OpenCV directly (no rembg/onnxruntime) to avoid Render timeout/memory 502 errors.
     Result: Sharp car + beautifully blurred original background (like DSLR bokeh).
     """
     rec = ProcessedImage.query.get(image_id)
     if not rec:
         return jsonify({'error': 'Image not found'}), 404
 
-    data    = request.get_json(silent=True) or {}
-    quality = data.get('quality', 'standard')
+    # Always use original image as source for blur (avoids chained processed paths)
+    src_path = rec.original_path
 
-    # Use processed image as source if available (e.g. plate already hidden)
-    src_path = rec.processed_path or rec.original_path
-
-    # Step 1: AI BG removal to get car mask
-    result, method = remove_bg_ai(src_path, quality=quality)
-    if result is None:
-        try:
-            result = Image.open(src_path).convert('RGBA')
-            method = 'original_kept'
-        except Exception:
-            return jsonify({'error': 'BG removal failed'}), 500
-
-    # Step 1b: Cleanup mask
+    # Step 1: Resize large images before processing to avoid Render memory/timeout
+    _resized_path = None
     try:
-        result = keep_largest_component(result)
-        result = remove_persons_and_objects(result)
-        result = remove_connected_persons(result)
-        result = trim_side_cars(result)
-        result = trim_top_objects(result)
-        result = remove_thin_protrusions(result)
-        result = restore_tyres(result)
-        result = restore_windshield(result)
-    except Exception as _e:
-        print(f'[blur_bg] cleanup error (non-fatal): {_e}')
+        _img_check = Image.open(src_path)
+        _w, _h = _img_check.size
+        _img_check.close()
+        if max(_w, _h) > 1600:
+            import tempfile, os as _os
+            _scale  = 1600 / max(_w, _h)
+            _img_rs = Image.open(src_path).convert('RGB')
+            _img_rs = _img_rs.resize((int(_w * _scale), int(_h * _scale)), Image.LANCZOS)
+            _tmp    = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+            _img_rs.save(_tmp.name, 'JPEG', quality=90)
+            _resized_path = _tmp.name
+            src_path = _resized_path
+            print(f'[blur_bg] resized large image to {int(_w*_scale)}x{int(_h*_scale)} for processing')
+    except Exception as _rs_err:
+        print(f'[blur_bg] resize check failed (non-fatal): {_rs_err}')
 
-    # Step 2: Apply blur — keep car sharp, blur real background
+    # Step 2: Use OpenCV GrabCut directly — skips rembg to avoid 502 on Render
+    result, method = remove_bg_car_opencv(src_path)
+
+    if result is None:
+        # Fallback: simple blur of whole image (still better than 502 error)
+        print('[blur_bg] GrabCut failed — falling back to full-image blur')
+        try:
+            import cv2, numpy as np
+            img_cv  = cv2.imread(src_path)
+            blurred = cv2.GaussianBlur(img_cv, (31, 31), 0)
+            result_pil = Image.fromarray(cv2.cvtColor(blurred, cv2.COLOR_BGR2RGB))
+            result = None  # signal to skip mask-based blur
+            _fallback_img = result_pil
+        except Exception:
+            _fallback_img = None
+        method = 'full_blur_fallback'
+    else:
+        _fallback_img = None
+
+    # Step 3: Apply blur — keep car sharp, blur real background
     pf       = _processed_folder()
     out_path = os.path.join(pf, f'blur_{rec.id}.jpg')
 
     try:
-        blurred = apply_60_percent_background_blur(src_path, result)
+        if result is not None:
+            blurred = apply_60_percent_background_blur(src_path, result)
+        elif _fallback_img is not None:
+            blurred = _fallback_img
+        else:
+            blurred = Image.open(src_path).convert('RGB')
+
         # Apply BOTH watermarks
         blurred = _apply_both_watermarks(blurred)
-        blurred.save(out_path, 'JPEG', quality=95)
+        blurred.save(out_path, 'JPEG', quality=92)
     except Exception as e:
         print(f'[blur_bg] blur failed: {e}')
         try:
             fallback = Image.open(src_path).convert('RGB')
             fallback = _apply_both_watermarks(fallback)
-            fallback.save(out_path, 'JPEG', quality=95)
+            fallback.save(out_path, 'JPEG', quality=92)
         except Exception:
+            if _resized_path and os.path.exists(_resized_path):
+                os.remove(_resized_path)
             return jsonify({'error': 'Save failed'}), 500
+
+    # Cleanup temp resized file
+    if _resized_path and os.path.exists(_resized_path):
+        try:
+            os.remove(_resized_path)
+        except Exception:
+            pass
 
     rec.processed_path = out_path
     rec.status         = 'completed'
