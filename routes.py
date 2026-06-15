@@ -26,6 +26,7 @@ from utils import (
     restore_tyres, restore_windshield,
     stamp_center_logo, add_logo_overlay,
     apply_tiled_watermark,
+    get_fallback_blur_mask,
     allowed_file
 )
 
@@ -174,24 +175,39 @@ def blur_bg(image_id):
     # Step 1: AI BG removal to get car mask
     result, method = remove_bg_ai(src_path, quality=quality)
     if result is None:
+        # FIX: previously this used Image.open(src_path).convert('RGBA'),
+        # which has alpha=255 everywhere -> the whole photo counted as
+        # "car" -> background never got blurred (this was the bug on
+        # Render where rembg + opencv grabcut both fail/get rejected).
+        # get_fallback_blur_mask() always returns a usable foreground
+        # mask so the blur step below has something to work with.
         try:
-            result = Image.open(src_path).convert('RGBA')
-            method = 'original_kept'
+            result = get_fallback_blur_mask(src_path)
+            method = 'fallback_grabcut'
+            if result is None:
+                raise ValueError('fallback mask returned None')
         except Exception:
-            return jsonify({'error': 'BG removal failed'}), 500
+            try:
+                result = Image.open(src_path).convert('RGBA')
+                method = 'original_kept'
+            except Exception:
+                return jsonify({'error': 'BG removal failed'}), 500
 
-    # Step 1b: Cleanup mask
-    try:
-        result = keep_largest_component(result)
-        result = remove_persons_and_objects(result)
-        result = remove_connected_persons(result)
-        result = trim_side_cars(result)
-        result = trim_top_objects(result)
-        result = remove_thin_protrusions(result)
-        result = restore_tyres(result)
-        result = restore_windshield(result)
-    except Exception as _e:
-        print(f'[blur_bg] cleanup error (non-fatal): {_e}')
+    # Step 1b: Cleanup mask (skip for the lightweight fallback mask —
+    # the person/edge-trimming steps assume a clean car-shaped mask and
+    # can wipe out the simple grabcut/rectangle fallback mask entirely)
+    if method != 'fallback_grabcut':
+        try:
+            result = keep_largest_component(result)
+            result = remove_persons_and_objects(result)
+            result = remove_connected_persons(result)
+            result = trim_side_cars(result)
+            result = trim_top_objects(result)
+            result = remove_thin_protrusions(result)
+            result = restore_tyres(result)
+            result = restore_windshield(result)
+        except Exception as _e:
+            print(f'[blur_bg] cleanup error (non-fatal): {_e}')
 
     # Step 2: Apply blur — keep car sharp, blur real background
     pf       = _processed_folder()
