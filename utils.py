@@ -105,39 +105,15 @@ def get_rembg_session(model='isnet-general-use'):
 
 
 def _prewarm():
-    """
-    Pre-warm the lightweight u2netp model in background so the very first
-    request doesn't pay the full model-download/load cost.
-    Wrapped so crashes never kill Flask.
-
-    NOTE: isnet-general-use (~170MB) is intentionally NOT pre-warmed here —
-    on small/free hosting plans (e.g. Render free tier, 512MB RAM) loading
-    it at boot alongside Flask/OpenCV/numpy can push memory over the limit
-    and make the whole app slow/unresponsive ("Bad Gateway") before it even
-    serves the first request. It is still loaded lazily (and cached) on the
-    first request that actually needs 'high'/'ultra' quality.
-    """
+    """Pre-warm u2net in background. Wrapped so crashes never kill Flask."""
     try:
-        get_rembg_session('u2netp')
+        get_rembg_session('isnet-general-use')
     except Exception as e:
         print(f'[rembg] pre-warm error (non-fatal): {e}')
 
 
-# FIX (Render "Port scan timeout / no open ports detected"):
-# Importing rembg pulls in pymatting -> scikit-image -> numba/llvmlite/scipy,
-# which are VERY heavy (numba alone JIT-compiles with LLVM on import and can
-# use 100s of MB). Doing this at boot, in a background thread, on a 512MB
-# free-tier instance can OOM-kill the worker BEFORE it ever binds the port —
-# Render then reports "no open ports detected" with no app logs at all,
-# because the process died during import, before printing anything.
-#
-# Pre-warming is therefore OFF by default so the app boots light and fast.
-# Set env var PREWARM_REMBG=1 ONLY on plans with enough RAM (roughly 1GB+).
-# Otherwise rembg/onnxruntime load lazily (and get cached) on the first
-# request that actually needs background removal.
-if os.environ.get('PREWARM_REMBG', '0') == '1':
-    # daemon=True ensures this thread won't block server shutdown
-    threading.Thread(target=_prewarm, daemon=True).start()
+# FIX: daemon=True ensures this thread won't block server shutdown
+threading.Thread(target=_prewarm, daemon=True).start()
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -224,10 +200,15 @@ def apply_60_percent_background_blur(original_image_path, masked_image_rgba):
         # Create binary mask: car = 255, background = 0
         car_mask = (alpha_mask > 128).astype(np.uint8) * 255
         
-        # Apply realistic moderate blur to background
-        # 31x31 kernel = moderate, realistic blur
-        blur_strength = 31
-        blurred_bg = cv2.GaussianBlur(orig_cv, (blur_strength, blur_strength), 0)
+        # ── Strong, size-adaptive background blur (~80% visible blur) ───────
+        # Sigma scales with image size so the blur is clearly visible on
+        # both small and large photos. (0,0) kernel size lets OpenCV pick
+        # the correct kernel for the given sigma.
+        h_img, w_img = orig_cv.shape[:2]
+        blur_sigma = max(18, int(min(h_img, w_img) * 0.035))
+        blurred_bg = cv2.GaussianBlur(orig_cv, (0, 0), sigmaX=blur_sigma, sigmaY=blur_sigma)
+        # Second pass for an extra-soft, strongly blurred background
+        blurred_bg = cv2.GaussianBlur(blurred_bg, (0, 0), sigmaX=blur_sigma * 0.6, sigmaY=blur_sigma * 0.6)
         
         # Create smooth mask for blending (feathered edges)
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -253,6 +234,86 @@ def apply_60_percent_background_blur(original_image_path, masked_image_rgba):
             return masked_image_rgba.convert('RGB')
 
 
+def get_fallback_blur_mask(filepath):
+    """
+    Last-resort foreground mask for the background-blur feature.
+
+    Used when remove_bg_ai() returns None for BOTH rembg and the full
+    OpenCV grabcut+cleanup pipeline (this happens often on Render's free
+    tier, where rembg/onnxruntime fails to import due to the numpy ABI
+    mismatch, AND the strict validate_mask_quality() check rejects the
+    plain grabcut result).
+
+    Without this, the old fallback was `Image.open(...).convert('RGBA')`,
+    which has alpha=255 everywhere -> the ENTIRE photo is treated as "car"
+    -> apply_60_percent_background_blur() blends 100% sharp pixels and the
+    background never gets blurred at all.
+
+    This function runs a quick, lightly-cleaned GrabCut (no person/edge
+    cleanup, no quality validation) and ALWAYS returns a usable RGBA mask —
+    if GrabCut itself produces something unusable, it falls back to a
+    centered rectangle so the blur still has an effect.
+    """
+    try:
+        import cv2
+        img_bgr = cv2.imread(filepath)
+        if img_bgr is None:
+            return Image.open(filepath).convert('RGBA')
+
+        h, w = img_bgr.shape[:2]
+        orig_size = (w, h)
+
+        work  = img_bgr
+        scale = 1.0
+        if max(h, w) > 1000:
+            scale = 1000 / max(h, w)
+            work  = cv2.resize(img_bgr, (int(w * scale), int(h * scale)))
+        wh, ww = work.shape[:2]
+
+        margin_x = max(int(ww * 0.08), 5)
+        margin_y = max(int(wh * 0.06), 5)
+        rect = (margin_x, margin_y, ww - 2 * margin_x, wh - 2 * margin_y)
+
+        mask = np.zeros((wh, ww), np.uint8)
+        bgd  = np.zeros((1, 65), np.float64)
+        fgd  = np.zeros((1, 65), np.float64)
+        cv2.grabCut(work, mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+
+        fg_mask = np.where(
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
+        ).astype(np.uint8)
+
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k, iterations=2)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  k, iterations=1)
+
+        # If grabcut produced almost nothing or almost everything,
+        # use a simple centered rectangle so blur still applies.
+        fg_ratio = float(fg_mask.mean()) / 255.0
+        if fg_ratio < 0.05 or fg_ratio > 0.85:
+            fg_mask[:] = 0
+            cx0, cx1 = int(ww * 0.12), int(ww * 0.88)
+            cy0, cy1 = int(wh * 0.15), int(wh * 0.95)
+            fg_mask[cy0:cy1, cx0:cx1] = 255
+
+        if scale != 1.0:
+            fg_mask = cv2.resize(fg_mask, orig_size, interpolation=cv2.INTER_LINEAR)
+
+        alpha = cv2.GaussianBlur(fg_mask, (9, 9), 0)
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb).convert('RGBA')
+        pil_img.putalpha(Image.fromarray(alpha).convert('L'))
+        return pil_img
+
+    except Exception as e:
+        print(f'[get_fallback_blur_mask] error: {e}')
+        try:
+            return Image.open(filepath).convert('RGBA')
+        except Exception:
+            return None
+
+
 def remove_bg_rembg(filepath, quality='standard'):
     """
     Remove background with rembg. Returns (PIL.Image RGBA, method_str) or
@@ -263,19 +324,13 @@ def remove_bg_rembg(filepath, quality='standard'):
         return None, None
     try:
         from rembg import remove
-        # FIX (Render/low-CPU hosts): 'isnet-general-use' (~170MB) is heavy and
-        # slow on shared/free CPUs, which was causing very long waits and
-        # request timeouts (502/504 "Bad Gateway"). 'standard' now uses the
-        # much lighter & faster 'u2netp' model — same one used for 'draft'.
-        # Heavier models are reserved for users who explicitly choose
-        # High / Ultra and are willing to wait longer.
         model_map = {
             'draft':    'u2netp',
-            'standard': 'u2netp',
+            'standard': 'isnet-general-use',
             'high':     'isnet-general-use',
             'ultra':    'isnet-general-use',
         }
-        model    = model_map.get(quality, 'u2netp')
+        model    = model_map.get(quality, 'isnet-general-use')
         session  = get_rembg_session(model)
         # FIX MemoryError: reduce max_side to avoid OOM on large images.
         # alpha_matting needs ~1.86 GiB for 5000px images — only enable for 'ultra'.
@@ -283,10 +338,8 @@ def remove_bg_rembg(filepath, quality='standard'):
             max_side = 640
         elif quality == 'ultra':
             max_side = 1024
-        elif quality == 'high':
-            max_side = 768
-        else:  # standard
-            max_side = 768
+        else:  # standard / high
+            max_side = 800
         img_bytes, orig_size = _resize_for_removal(filepath, max_side)
         # FIX MemoryError: alpha_matting=True on high-res images causes huge allocations.
         # Only enable for 'ultra' quality; standard/high use clean rembg mask (still good).
