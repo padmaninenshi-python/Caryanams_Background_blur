@@ -7,6 +7,7 @@ import os
 import io
 import uuid
 import base64
+import numpy as np
 from datetime import datetime
 
 from flask import (
@@ -19,14 +20,9 @@ from extensions import db
 from utils import (
     detect_number_plate, apply_plate_removal,
     apply_60_percent_background_blur,
-    remove_bg_ai,
-    keep_largest_component, remove_persons_and_objects,
-    remove_connected_persons, trim_side_cars,
-    trim_top_objects, remove_thin_protrusions,
-    restore_tyres, restore_windshield,
+    get_blur_car_mask,
     stamp_center_logo, add_logo_overlay,
     apply_tiled_watermark,
-    get_fallback_blur_mask,
     allowed_file
 )
 
@@ -159,62 +155,53 @@ def upload():
 
 @bp.route('/api/blur-bg/<image_id>', methods=['POST'])
 def blur_bg(image_id):
-    """Remove background via AI and apply depth-of-field blur to background only.
-    Result: Sharp car + beautifully blurred original background (like DSLR bokeh).
+    """Apply depth-of-field blur to background only (car stays sharp).
+
+    FIX (speed): previously this ran remove_bg_ai() (rembg attempt — not
+    even installed, wasted time — then full OpenCV grabcut) followed by 8
+    heavy cleanup passes (keep_largest_component, remove_persons_and_objects,
+    remove_connected_persons, trim_side_cars, trim_top_objects,
+    remove_thin_protrusions, restore_tyres, restore_windshield). That whole
+    pipeline is built for pixel-perfect cutouts and is SLOW on Render's
+    free-tier CPU.
+
+    For blur we only need a rough car-region mask, so we use
+    get_blur_car_mask() — a single-pass, low-resolution GrabCut. If even
+    that fails/looks wrong, apply_60_percent_background_blur() itself falls
+    back to a centered-rectangle mask, so the background ALWAYS gets blurred.
     """
     rec = ProcessedImage.query.get(image_id)
     if not rec:
         return jsonify({'error': 'Image not found'}), 404
 
-    data    = request.get_json(silent=True) or {}
-    quality = data.get('quality', 'standard')
-
     # Use processed image as source if available (e.g. plate already hidden)
     src_path = rec.processed_path or rec.original_path
 
-    # Step 1: AI BG removal to get car mask
-    result, method = remove_bg_ai(src_path, quality=quality)
-    if result is None:
-        # FIX: previously this used Image.open(src_path).convert('RGBA'),
-        # which has alpha=255 everywhere -> the whole photo counted as
-        # "car" -> background never got blurred (this was the bug on
-        # Render where rembg + opencv grabcut both fail/get rejected).
-        # get_fallback_blur_mask() always returns a usable foreground
-        # mask so the blur step below has something to work with.
-        try:
-            result = get_fallback_blur_mask(src_path)
-            method = 'fallback_grabcut'
-            if result is None:
-                raise ValueError('fallback mask returned None')
-        except Exception:
-            try:
-                result = Image.open(src_path).convert('RGBA')
-                method = 'original_kept'
-            except Exception:
-                return jsonify({'error': 'BG removal failed'}), 500
+    # Step 1: fast, rough car-region mask (just for blur — not a cutout)
+    mask_rgba = None
+    try:
+        fg_mask = get_blur_car_mask(src_path)
+        if fg_mask is not None:
+            orig = Image.open(src_path).convert('RGB')
+            if (fg_mask.shape[1], fg_mask.shape[0]) != orig.size:
+                fg_mask = np.array(
+                    Image.fromarray(fg_mask).resize(orig.size, Image.NEAREST)
+                )
+            rgba_arr  = np.dstack([np.array(orig), fg_mask]).astype(np.uint8)
+            mask_rgba = Image.fromarray(rgba_arr, 'RGBA')
+    except Exception as e:
+        print(f'[blur_bg] mask error (non-fatal): {e}')
+        mask_rgba = None
 
-    # Step 1b: Cleanup mask (skip for the lightweight fallback mask —
-    # the person/edge-trimming steps assume a clean car-shaped mask and
-    # can wipe out the simple grabcut/rectangle fallback mask entirely)
-    if method != 'fallback_grabcut':
-        try:
-            result = keep_largest_component(result)
-            result = remove_persons_and_objects(result)
-            result = remove_connected_persons(result)
-            result = trim_side_cars(result)
-            result = trim_top_objects(result)
-            result = remove_thin_protrusions(result)
-            result = restore_tyres(result)
-            result = restore_windshield(result)
-        except Exception as _e:
-            print(f'[blur_bg] cleanup error (non-fatal): {_e}')
-
-    # Step 2: Apply blur — keep car sharp, blur real background
+    # Step 2: Apply blur — keep car sharp, blur real background.
+    # mask_rgba may be None — apply_60_percent_background_blur() handles
+    # that (and any other degenerate mask) with its own center-rect fallback.
     pf       = _processed_folder()
     out_path = os.path.join(pf, f'blur_{rec.id}.jpg')
+    method   = 'fast_blur' if mask_rgba is not None else 'fast_blur_centerrect'
 
     try:
-        blurred = apply_60_percent_background_blur(src_path, result)
+        blurred = apply_60_percent_background_blur(src_path, mask_rgba)
         # Apply BOTH watermarks
         blurred = _apply_both_watermarks(blurred)
         blurred.save(out_path, 'JPEG', quality=95)
