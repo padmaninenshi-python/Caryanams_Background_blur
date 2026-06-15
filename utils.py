@@ -105,9 +105,20 @@ def get_rembg_session(model='isnet-general-use'):
 
 
 def _prewarm():
-    """Pre-warm u2net in background. Wrapped so crashes never kill Flask."""
+    """
+    Pre-warm the lightweight u2netp model in background so the very first
+    request doesn't pay the full model-download/load cost.
+    Wrapped so crashes never kill Flask.
+
+    NOTE: isnet-general-use (~170MB) is intentionally NOT pre-warmed here —
+    on small/free hosting plans (e.g. Render free tier, 512MB RAM) loading
+    it at boot alongside Flask/OpenCV/numpy can push memory over the limit
+    and make the whole app slow/unresponsive ("Bad Gateway") before it even
+    serves the first request. It is still loaded lazily (and cached) on the
+    first request that actually needs 'high'/'ultra' quality.
+    """
     try:
-        get_rembg_session('isnet-general-use')
+        get_rembg_session('u2netp')
     except Exception as e:
         print(f'[rembg] pre-warm error (non-fatal): {e}')
 
@@ -239,13 +250,19 @@ def remove_bg_rembg(filepath, quality='standard'):
         return None, None
     try:
         from rembg import remove
+        # FIX (Render/low-CPU hosts): 'isnet-general-use' (~170MB) is heavy and
+        # slow on shared/free CPUs, which was causing very long waits and
+        # request timeouts (502/504 "Bad Gateway"). 'standard' now uses the
+        # much lighter & faster 'u2netp' model — same one used for 'draft'.
+        # Heavier models are reserved for users who explicitly choose
+        # High / Ultra and are willing to wait longer.
         model_map = {
             'draft':    'u2netp',
-            'standard': 'isnet-general-use',
+            'standard': 'u2netp',
             'high':     'isnet-general-use',
             'ultra':    'isnet-general-use',
         }
-        model    = model_map.get(quality, 'isnet-general-use')
+        model    = model_map.get(quality, 'u2netp')
         session  = get_rembg_session(model)
         # FIX MemoryError: reduce max_side to avoid OOM on large images.
         # alpha_matting needs ~1.86 GiB for 5000px images — only enable for 'ultra'.
@@ -253,8 +270,10 @@ def remove_bg_rembg(filepath, quality='standard'):
             max_side = 640
         elif quality == 'ultra':
             max_side = 1024
-        else:  # standard / high
-            max_side = 800
+        elif quality == 'high':
+            max_side = 768
+        else:  # standard
+            max_side = 768
         img_bytes, orig_size = _resize_for_removal(filepath, max_side)
         # FIX MemoryError: alpha_matting=True on high-res images causes huge allocations.
         # Only enable for 'ultra' quality; standard/high use clean rembg mask (still good).
