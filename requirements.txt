@@ -6,3 +6,4 @@ opencv-python-headless>=4.8.0
 rembg>=2.0.50
 onnxruntime>=1.16.0
 gunicorn>=21.2.0
+python version==3.12
