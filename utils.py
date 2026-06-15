@@ -123,8 +123,21 @@ def _prewarm():
         print(f'[rembg] pre-warm error (non-fatal): {e}')
 
 
-# FIX: daemon=True ensures this thread won't block server shutdown
-threading.Thread(target=_prewarm, daemon=True).start()
+# FIX (Render "Port scan timeout / no open ports detected"):
+# Importing rembg pulls in pymatting -> scikit-image -> numba/llvmlite/scipy,
+# which are VERY heavy (numba alone JIT-compiles with LLVM on import and can
+# use 100s of MB). Doing this at boot, in a background thread, on a 512MB
+# free-tier instance can OOM-kill the worker BEFORE it ever binds the port —
+# Render then reports "no open ports detected" with no app logs at all,
+# because the process died during import, before printing anything.
+#
+# Pre-warming is therefore OFF by default so the app boots light and fast.
+# Set env var PREWARM_REMBG=1 ONLY on plans with enough RAM (roughly 1GB+).
+# Otherwise rembg/onnxruntime load lazily (and get cached) on the first
+# request that actually needs background removal.
+if os.environ.get('PREWARM_REMBG', '0') == '1':
+    # daemon=True ensures this thread won't block server shutdown
+    threading.Thread(target=_prewarm, daemon=True).start()
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
