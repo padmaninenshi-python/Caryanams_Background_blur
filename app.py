@@ -1,16 +1,17 @@
 """
 Standalone Remove Background + Number Plate Tool
-Run: python app.py
-Visit: http://localhost:5000
+Local run : python app.py
+Render run: gunicorn app:app   (see Procfile)
 """
 
 import os
 from flask import Flask
 from extensions import db
 
+
 def create_app():
     app = Flask(__name__)
-    app.secret_key = 'removebg-standalone-secret'
+    app.secret_key = os.environ.get('SECRET_KEY', 'removebg-standalone-secret')
 
     # SQLite DB
     db_path = os.path.join(app.root_path, 'instance', 'removebg.db')
@@ -36,7 +37,18 @@ def create_app():
     return app
 
 
+# ── Module-level app object ─────────────────────────────────────────────────
+# Required so gunicorn can be started with "gunicorn app:app" (see Procfile).
+# This also runs once when the worker process boots — same on Render & locally.
+app = create_app()
+
+
 if __name__ == '__main__':
-    app = create_app()
-    print("\n✅  Remove BG Tool running at http://localhost:5000\n")
-    app.run(debug=True, port=5000)
+    # Local dev only. On Render, gunicorn (see Procfile) starts the app instead
+    # and this block is never executed.
+    port  = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    print(f"\n✅  Remove BG Tool running at http://0.0.0.0:{port}\n")
+    # host='0.0.0.0' -> reachable from outside container (required on Render)
+    # threaded=True  -> lets one slow AI request not block every other request
+    app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
