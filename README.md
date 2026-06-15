@@ -46,8 +46,41 @@ Open browser at: http://localhost:5000
 Place a file called `ba1_studio.jpg` in the `static/custom_bgs/` folder.
 This will be used as the showroom background. Without it, a white background is used.
 
+## Deploying on Render
+
+1. Push this folder to a GitHub repo and create a new **Web Service** on Render
+   pointing at it.
+2. **Build Command:**
+   ```
+   pip install -r requirements.txt
+   ```
+3. **Start Command:** leave it blank — Render will auto-detect the `Procfile`
+   (`web: gunicorn app:app ...`). If you want to set it manually instead:
+   ```
+   gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --worker-class gthread --timeout 300
+   ```
+4. **Do not** set a Start Command of `python app.py` on Render — that runs
+   Flask's single-request dev server, which is why one image being processed
+   used to block every other request ("ek process chal raha to dusra nahi ho
+   raha"). `gunicorn` with `--threads 4` fixes this.
+5. Render's free plan has limited CPU/RAM. AI background removal is CPU-heavy,
+   so the first request after a deploy/restart (cold start) will still be
+   slower than later requests. If requests still time out / show "Bad
+   Gateway" under load, try:
+   - Selecting **Standard** or **Draft** quality instead of High/Ultra (Ultra
+     uses the heaviest model and is the slowest).
+   - Upgrading to a paid Render instance with more CPU/RAM.
+
+> ⚠️ Render's free filesystem is **ephemeral** — uploaded/processed images in
+> `static/uploads/` and `static/processed/`, and the SQLite DB in `instance/`,
+> are wiped on every redeploy/restart. For persistent storage across deploys,
+> attach a Render **Persistent Disk** mounted at this app's root, or move to
+> S3-compatible object storage + a managed database.
+
 ## Notes
 
-- `rembg` is the AI background removal engine (requires ~150MB model download on first run)
-- Falls back to OpenCV GrabCut if rembg is unavailable
-- All uploaded and processed images are stored in `static/uploads/` and `static/processed/`
+- `rembg` is the AI background removal engine. `draft` and `standard` quality
+  use the small, fast `u2netp` model (~5MB); `high`/`ultra` use the larger
+  `isnet-general-use` model (~170MB, downloaded on first use of that quality).
+- Falls back to OpenCV GrabCut if rembg is unavailable.
+- All uploaded and processed images are stored in `static/uploads/` and `static/processed/`.
